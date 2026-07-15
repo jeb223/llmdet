@@ -350,6 +350,7 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
     else:
         print(f"NMS IoU: {args.nms_iou}" if args.nms_iou is not None else "NMS: disabled")
         print(f"Max detections per query: {args.max_detections_per_query}")
+    print(f"SAM box batch size: {args.sam_box_batch_size}")
 
     inferencer, repo_path, config_path, checkpoint_path = load_llmdet(args, device)
     sam_predictor, sam_checkpoint = load_sam(args, device)
@@ -438,48 +439,50 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
 
         if detections:
             sam_predictor.set_image(np_image)
-            input_boxes = torch.tensor(
-                [detection["box_xyxy"] for detection in detections],
-                dtype=torch.float32,
-                device=device,
-            )
-            with torch.no_grad():
-                transformed_boxes = sam_predictor.transform.apply_boxes_torch(
-                    input_boxes, np_image.shape[:2]
+            for start in range(0, len(detections), args.sam_box_batch_size):
+                detection_batch = detections[start:start + args.sam_box_batch_size]
+                input_boxes = torch.tensor(
+                    [detection["box_xyxy"] for detection in detection_batch],
+                    dtype=torch.float32,
+                    device=device,
                 )
-                masks, sam_scores, _ = sam_predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes,
-                    multimask_output=False,
-                )
+                with torch.no_grad():
+                    transformed_boxes = sam_predictor.transform.apply_boxes_torch(
+                        input_boxes, np_image.shape[:2]
+                    )
+                    masks, sam_scores, _ = sam_predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False,
+                    )
 
-            masks_np = masks[:, 0].detach().cpu().numpy().astype(np.uint8)
-            sam_scores_np = (
-                sam_scores[:, 0].detach().cpu().numpy().tolist()
-                if sam_scores is not None
-                else [1.0] * len(detections)
-            )
-            for detection, mask, sam_score in zip(detections, masks_np, sam_scores_np):
-                rle = encode_binary_mask(mask)
-                det_score = float(detection["score"])
-                final_score = det_score * float(sam_score) if args.use_sam_score else det_score
-                predictions.append(
-                    {
-                        "image_id": int(image_info["id"]),
-                        "category_id": int(detection["category_id"]),
-                        "bbox": [float(value) for value in xyxy_to_xywh(detection["box_xyxy"])],
-                        "segmentation": rle,
-                        "area": float(mask_utils.area(rle)),
-                        "score": float(final_score),
-                        "det_score": det_score,
-                        "sam_score": float(sam_score),
-                        "category_name": detection["category_name"],
-                        "text_label": detection["text_label"],
-                        "prompt": detection["prompt"],
-                        "file_name": image_info["file_name"],
-                    }
+                masks_np = masks[:, 0].detach().cpu().numpy().astype(np.uint8)
+                sam_scores_np = (
+                    sam_scores[:, 0].detach().cpu().numpy().tolist()
+                    if sam_scores is not None
+                    else [1.0] * len(detection_batch)
                 )
+                for detection, mask, sam_score in zip(detection_batch, masks_np, sam_scores_np):
+                    rle = encode_binary_mask(mask)
+                    det_score = float(detection["score"])
+                    final_score = det_score * float(sam_score) if args.use_sam_score else det_score
+                    predictions.append(
+                        {
+                            "image_id": int(image_info["id"]),
+                            "category_id": int(detection["category_id"]),
+                            "bbox": [float(value) for value in xyxy_to_xywh(detection["box_xyxy"])],
+                            "segmentation": rle,
+                            "area": float(mask_utils.area(rle)),
+                            "score": float(final_score),
+                            "det_score": det_score,
+                            "sam_score": float(sam_score),
+                            "category_name": detection["category_name"],
+                            "text_label": detection["text_label"],
+                            "prompt": detection["prompt"],
+                            "file_name": image_info["file_name"],
+                        }
+                    )
 
         if args.log_every > 0 and (
             index == 1 or index % args.log_every == 0 or index == len(images)
@@ -851,6 +854,7 @@ def main():
     parser.add_argument("--llmdet-chunked-size", type=int, default=-1, help="LLMDet test_cfg.chunked_size override.")
     parser.add_argument("--sam-checkpoint", type=str, default=None, help="SAM checkpoint; required without --pred-json.")
     parser.add_argument("--sam-model-type", choices=["vit_b", "vit_l", "vit_h"], default="vit_b", help="SAM model type.")
+    parser.add_argument("--sam-box-batch-size", type=int, default=32, help="Number of detection boxes sent to SAM at once.")
     parser.add_argument("--device", type=str, default="auto", help="auto, cuda, cuda:0, or cpu.")
 
     parser.add_argument(
@@ -884,6 +888,8 @@ def main():
     parser.add_argument("--strict", action="store_true", help="Fail on a missing image instead of skipping it.")
     args = parser.parse_args()
 
+    if args.sam_box_batch_size < 1:
+        raise ValueError("--sam-box-batch-size must be at least 1.")
     if args.box_threshold is None:
         args.box_threshold = 0.0 if args.query_mode == "mmdet-standard" else 0.3
     if args.nms_iou is not None and args.nms_iou < 0:
@@ -973,6 +979,7 @@ def main():
         "llmdet_checkpoint": str(args.llmdet_checkpoint) if generated_predictions else None,
         "sam_checkpoint": str(args.sam_checkpoint) if generated_predictions else None,
         "sam_model_type": args.sam_model_type,
+        "sam_box_batch_size": args.sam_box_batch_size,
         "query_mode": args.query_mode,
         "query_protocol": query_protocol,
         "box_threshold": args.box_threshold,
