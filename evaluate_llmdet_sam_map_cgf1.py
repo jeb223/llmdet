@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Standalone LLMDet + SAM mask evaluation for SAM3_LoRA-style COCO data.
+"""Standalone LLMDet + SAM mask evaluation for COCO data.
 
 Pipeline:
-    COCO image -> one LLMDet query per category -> SAM box-prompted mask
-    -> COCO APmask + closed-set cgF1.
+    COCO image -> MMDet-compatible multi-class LLMDet inference
+    -> SAM box-prompted masks -> COCO APmask + closed-set cgF1.
 
-The default ``per-category`` query mode evaluates every category on every image.
-This includes negative queries and matches the ``all_categories`` protocol in
-SAM3_LoRA_1's validator. The cgF1 implementation is embedded here so this file
-does not import SAM3_LoRA_1 or any other project evaluation script.
+The default ``mmdet-standard`` mode submits the full ordered category list to
+LLMDet once per image. It preserves LLMDet's native labels, scores, and
+``test_cfg.max_per_img`` output, so its bbox AP is directly comparable with
+``mmdet_test.py``. The cgF1 implementation is embedded here so this file does
+not import SAM3_LoRA_1 or any other project evaluation script.
 
 Required runtime packages:
     torch, numpy, pillow, pycocotools, segment-anything
@@ -288,6 +289,13 @@ def build_llmdet_queries(image_id, args, gt_data, id_to_name, present_category_i
     ]
 
 
+def build_mmdet_standard_query(id_to_name):
+    """Return the dataset text list and its LLMDet-label to COCO-id mapping."""
+    category_ids = sorted(id_to_name)
+    category_names = [id_to_name[category_id] for category_id in category_ids]
+    return category_names, dict(enumerate(category_ids))
+
+
 def predict_llmdet_boxes(inferencer, image_path, prompt, args):
     result = inferencer(
         str(image_path),
@@ -328,6 +336,7 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
     id_to_name, _ = build_category_maps(gt_data)
     present_category_ids = build_image_present_category_ids(gt_data)
     images = [dict(image) for image in gt_data.get("images", [])]
+    standard_texts, standard_label_to_category_id = build_mmdet_standard_query(id_to_name)
 
     print("\n" + "=" * 80)
     print("LLMDET + SAM MASK INFERENCE")
@@ -335,8 +344,12 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
     print(f"Images: {len(images)}")
     print(f"Query mode: {args.query_mode}")
     print(f"Box threshold: {args.box_threshold:.3f}")
-    print(f"NMS IoU: {args.nms_iou}" if args.nms_iou is not None else "NMS: disabled")
-    print(f"Max detections per query: {args.max_detections_per_query}")
+    if args.query_mode == "mmdet-standard":
+        print("Post-processing: native LLMDet test_cfg output (no external NMS or Top-K)")
+        print(f"Classes in one query: {len(standard_texts)}")
+    else:
+        print(f"NMS IoU: {args.nms_iou}" if args.nms_iou is not None else "NMS: disabled")
+        print(f"Max detections per query: {args.max_detections_per_query}")
 
     inferencer, repo_path, config_path, checkpoint_path = load_llmdet(args, device)
     sam_predictor, sam_checkpoint = load_sam(args, device)
@@ -359,14 +372,18 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
         pil_image = Image.open(image_path).convert("RGB")
         width, height = pil_image.size
         np_image = np.array(pil_image)
-        queries = build_llmdet_queries(
-            image_info["id"], args, gt_data, id_to_name, present_category_ids
-        )
         detections = []
-        for category_id, category_name, prompt in queries:
-            boxes, scores, labels = predict_llmdet_boxes(inferencer, image_path, prompt, args)
-            valid_boxes, valid_scores, valid_labels = [], [], []
+        if args.query_mode == "mmdet-standard":
+            boxes, scores, labels = predict_llmdet_boxes(
+                inferencer, image_path, standard_texts, args
+            )
             for box, score, label in zip(boxes, scores, labels):
+                label = int(label)
+                if label not in standard_label_to_category_id:
+                    raise RuntimeError(
+                        "LLMDet returned a label outside the configured class list: "
+                        f"{label} not in [0, {len(standard_texts) - 1}]."
+                    )
                 score = float(score)
                 if score < float(args.box_threshold):
                     continue
@@ -374,24 +391,50 @@ def generate_llmdet_sam_predictions(gt_data, gt_path, args):
                 if xyxy_to_xywh(box)[2] <= 0.0 or xyxy_to_xywh(box)[3] <= 0.0:
                     skipped_empty_boxes += 1
                     continue
-                valid_boxes.append(box)
-                valid_scores.append(score)
-                valid_labels.append(label)
-
-            keep = run_nms(valid_boxes, valid_scores, args.nms_iou)
-            if args.max_detections_per_query is not None:
-                keep = keep[: args.max_detections_per_query]
-            for keep_index in keep:
+                category_id = standard_label_to_category_id[label]
                 detections.append(
                     {
-                        "box_xyxy": valid_boxes[keep_index],
-                        "score": valid_scores[keep_index],
-                        "category_id": int(category_id),
-                        "category_name": category_name,
-                        "text_label": str(valid_labels[keep_index]),
-                        "prompt": prompt,
+                        "box_xyxy": box,
+                        "score": score,
+                        "category_id": category_id,
+                        "category_name": id_to_name[category_id],
+                        "text_label": str(label),
+                        "prompt": list(standard_texts),
                     }
                 )
+        else:
+            queries = build_llmdet_queries(
+                image_info["id"], args, gt_data, id_to_name, present_category_ids
+            )
+            for category_id, category_name, prompt in queries:
+                boxes, scores, labels = predict_llmdet_boxes(inferencer, image_path, prompt, args)
+                valid_boxes, valid_scores, valid_labels = [], [], []
+                for box, score, label in zip(boxes, scores, labels):
+                    score = float(score)
+                    if score < float(args.box_threshold):
+                        continue
+                    box = clip_xyxy(box, width, height)
+                    if xyxy_to_xywh(box)[2] <= 0.0 or xyxy_to_xywh(box)[3] <= 0.0:
+                        skipped_empty_boxes += 1
+                        continue
+                    valid_boxes.append(box)
+                    valid_scores.append(score)
+                    valid_labels.append(label)
+
+                keep = run_nms(valid_boxes, valid_scores, args.nms_iou)
+                if args.max_detections_per_query is not None:
+                    keep = keep[: args.max_detections_per_query]
+                for keep_index in keep:
+                    detections.append(
+                        {
+                            "box_xyxy": valid_boxes[keep_index],
+                            "score": valid_scores[keep_index],
+                            "category_id": int(category_id),
+                            "category_name": category_name,
+                            "text_label": str(valid_labels[keep_index]),
+                            "prompt": prompt,
+                        }
+                    )
 
         if detections:
             sam_predictor.set_image(np_image)
@@ -810,10 +853,27 @@ def main():
     parser.add_argument("--sam-model-type", choices=["vit_b", "vit_l", "vit_h"], default="vit_b", help="SAM model type.")
     parser.add_argument("--device", type=str, default="auto", help="auto, cuda, cuda:0, or cpu.")
 
-    parser.add_argument("--query-mode", choices=["per-category", "present-categories"], default="per-category", help="per-category queries all classes per image and matches SAM3_LoRA_1 all_categories; present-categories is a positive-only legacy ablation.")
-    parser.add_argument("--box-threshold", type=float, default=0.3, help="LLMDet score threshold.")
-    parser.add_argument("--nms-iou", type=float, default=0.7, help="Per-query box NMS IoU; set negative to disable.")
-    parser.add_argument("--max-detections-per-query", type=int, default=100, help="Top-K boxes per image-category query after NMS.")
+    parser.add_argument(
+        "--query-mode",
+        choices=["mmdet-standard", "per-category", "present-categories"],
+        default="mmdet-standard",
+        help=(
+            "mmdet-standard performs one full-class inference per image and preserves "
+            "native LLMDet output; per-category and present-categories are legacy "
+            "prompt ablations."
+        ),
+    )
+    parser.add_argument(
+        "--box-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum score sent to SAM. Defaults to 0.0 for mmdet-standard, preserving "
+            "COCO AP ranking, and 0.3 for legacy query modes."
+        ),
+    )
+    parser.add_argument("--nms-iou", type=float, default=0.7, help="Legacy per-query box NMS IoU; set negative to disable.")
+    parser.add_argument("--max-detections-per-query", type=int, default=100, help="Legacy Top-K boxes per image-category query after NMS.")
     parser.add_argument("--use-sam-score", action="store_true", help="Use detection score multiplied by SAM predicted IoU as final confidence.")
 
     parser.add_argument("--eval-category-id", type=int, action="append", default=None, help="Evaluate only this category id; can be repeated.")
@@ -824,10 +884,14 @@ def main():
     parser.add_argument("--strict", action="store_true", help="Fail on a missing image instead of skipping it.")
     args = parser.parse_args()
 
+    if args.box_threshold is None:
+        args.box_threshold = 0.0 if args.query_mode == "mmdet-standard" else 0.3
     if args.nms_iou is not None and args.nms_iou < 0:
         args.nms_iou = None
     if args.query_mode == "present-categories":
         print("WARNING: present-categories is positive-only and does not match SAM3_LoRA_1 all_categories.")
+    elif args.query_mode == "per-category":
+        print("WARNING: per-category inference is not comparable with MMDet's multi-class evaluation.")
     if not args.pred_json:
         missing = [
             option for option, value in (
@@ -894,11 +958,11 @@ def main():
         print("=" * 80)
         metrics.update(run_sam3_lora_compatible_cgf1(eval_gt, predictions, "segm"))
 
-    query_protocol = (
-        "one_query_per_gt_present_category_per_image"
-        if args.query_mode == "present-categories"
-        else "one_query_per_dataset_category_per_image"
-    )
+    query_protocol = {
+        "mmdet-standard": "one_full_dataset_category_list_per_image",
+        "per-category": "one_query_per_dataset_category_per_image",
+        "present-categories": "one_query_per_gt_present_category_per_image",
+    }[args.query_mode]
     payload = {
         "gt_json": str(gt_path),
         "pred_json": str(args.pred_json) if args.pred_json else None,
@@ -912,8 +976,10 @@ def main():
         "query_mode": args.query_mode,
         "query_protocol": query_protocol,
         "box_threshold": args.box_threshold,
-        "nms_iou": args.nms_iou,
-        "max_detections_per_query": args.max_detections_per_query,
+        "nms_iou": args.nms_iou if args.query_mode != "mmdet-standard" else None,
+        "max_detections_per_query": (
+            args.max_detections_per_query if args.query_mode != "mmdet-standard" else None
+        ),
         "max_images": args.max_images,
         "use_sam_score": bool(args.use_sam_score),
         "cgf1_protocol": "sam3_lora_1_closed_set_all_categories_compatible",
